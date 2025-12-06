@@ -1,0 +1,145 @@
+Tiny Analytics Agent
+====================
+
+0. Purpose
+----------
+Build a tiny "analytics agent" in Databricks:
+
+- It can answer questions by reasoning with a foundation model (LLM).
+- It can also run short Python snippets to do small data calculations via a Unity Catalog function.
+- We log it with MLflow, deploy it as a serving endpoint, and test it from the Databricks Review App.
+- Optional / future work: connect it to a richer Databricks App template.
+
+1. Big picture
+--------------
+User question
+  -> agent sends it to a foundation model (LLM)
+  -> LLM may decide to call a tool (Python interpreter)
+  -> Python code runs, returns a text result
+  -> (optional) LLM uses that result to generate a short natural‑language answer
+  -> agent returns a simple text message to the caller.
+
+The agent is stateless: every request is handled independently, using only the latest user message.
+
+2. Foundation model endpoint
+----------------------------
+- We pick one existing Databricks Model Serving endpoint (LLM_ENDPOINT_NAME), e.g. a Llama 3 instruct model that is enabled in the workspace.
+- We call it with the OpenAI-compatible client from WorkspaceClient.
+- The model receives:
+  - a system prompt (how it should behave) in the second call,
+  - the user message,
+  - the list of tools it is allowed to call (first call).
+
+3. Tool: system.ai.python_exec
+------------------------------
+- This is a Unity Catalog function that executes Python code in a controlled environment.
+- Our agent exposes it to the LLM as a "tool".
+- When the LLM wants to run Python, it emits a tool call with:
+  - tool name,
+  - JSON arguments (the Python code and optional context).
+- We route that to DatabricksFunctionClient.execute_function("system.ai.python_exec", ...).
+- The tool returns plain text (whatever the Python code printed).
+
+4. Helper functions
+-------------------
+- call_tool(tool_name, parameters):
+  - Validates the tool name (we only support system__ai__python_exec).
+  - Calls the UC function and returns the textual output.
+- _build_text_events(text, item_id):
+  - Wraps a plain text string into the minimal Responses event shape:
+    - one delta event,
+    - one final output_item.done event.
+
+5. run_agent (core loop)
+------------------------
+- Input: a single user prompt string (no history).
+- Step 1: first LLM call with tools enabled:
+  - messages = [{"role": "user", "content": prompt}]
+  - tools = [definition of system.ai.python_exec]
+  - If the model does NOT call a tool:
+    - we return its message as text events and stop.
+- Step 2: if there IS a tool call:
+  - Parse its JSON arguments to extract the Python code.
+  - Call call_tool() to execute system.ai.python_exec.
+  - Capture the tool_output (text).
+- Step 3 (optional second LLM call):
+  - Build a new message list with:
+    - a system prompt that asks for a short answer (and optional one‑line explanation),
+    - the original user message,
+    - the tool result (as if the assistant had run the code).
+  - Call the LLM again WITHOUT tools.
+  - Take the final text from this call.
+- Step 4: convert the final text into Responses events using _build_text_events().
+- This is the "brain" of the agent in notebook form.
+
+6. TinyAnalyticsAgent (MLflow wrapper)
+--------------------------------------
+- Subclass of `mlflow.pyfunc.ResponsesAgent`.
+- predict_stream(request):
+  - Extracts the last user message from the request (stateless).
+  - Calls run_agent(prompt).
+  - Yields ResponsesAgentStreamEvent objects built from the dict chunks.
+- predict(request):
+  - Consumes predict_stream().
+  - Collects only the final output items.
+  - Returns a ResponsesAgentResponse.
+- This class is what we actually log as the MLflow model.
+
+7. Python file for logging
+--------------------------
+- We write all the agent code to `uc_analytics_agent.py` using %%writefile.
+- At the end of that file:
+  - We create `AGENT = TinyAnalyticsAgent()`.
+  - We call `mlflow.models.set_model(AGENT)`.
+- MLflow uses this file when reconstructing the agent in serving.
+
+8. MLflow logging and UC registration
+-------------------------------------
+- We set the MLflow registry URI to `databricks-uc`.
+- We call `mlflow.pyfunc.log_model()` with:
+  - artifact_path = "agent"
+  - python_model = "uc_analytics_agent.py"
+  - resources:
+    - DatabricksServingEndpoint(LLM endpoint).
+    - DatabricksFunction(system.ai.python_exec).
+  - registered_model_name = a UC model path (catalog.schema.name).
+- Result: we get a registered model version for our agent.
+
+9. Deployment to Model Serving (Agent endpoint)
+-----------------------------------------------
+- We call `databricks.agents.deploy()` with:
+  - model_name: the registered UC model name.
+  - model_version: the version returned by log_model().
+  - scale_to_zero=True (optional to save cost).
+- Databricks creates an **Agent** serving endpoint that:
+  - Accepts Requests/Responses API-compatible calls.
+  - Internally uses our TinyAnalyticsAgent, which uses run_agent().
+
+10. Using it from Review App (current PoC)
+------------------------------------------
+- In Review App, we select the Agent endpoint.
+- We can chat with the agent:
+  - For example: "Create a tiny store visits table and tell me which city has the highest total revenue."
+  - The trace shows:
+    - LLM call,
+    - tool call to system.ai.python_exec,
+    - tool output,
+    - final answer.
+- This is our main UI for the PoC.
+
+11. Using it from a Databricks App (future work)
+------------------------------------------------
+- The basic Chatbot App template only supports chat-completions endpoints.
+- Our Agent endpoint speaks the Responses protocol, so it is not directly compatible.
+- For a full app UI on top of the agent we would need:
+  - a richer Databricks App template (e.g. the Next.js sample), or
+  - a small custom app that calls the Agent endpoint via the OpenAI-compatible client.
+- This is left as a TODO for a follow‑up iteration.
+
+Mental model summary
+--------------------
+- The notebook defines a very small, stateless agent loop (run_agent).
+- We wrap it into a standard ResponsesAgent shape (TinyAnalyticsAgent).
+- MLflow turns that into a reusable, versioned model in Unity Catalog.
+- Agent deployment turns the model into an HTTP endpoint that supports the Requests/Responses protocol.
+- Review App (and later Apps) just call that endpoint to talk to the agent.

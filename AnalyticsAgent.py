@@ -32,6 +32,8 @@ dbutils.library.restartPython()
 # COMMAND ----------
 
 # MAGIC %sql
+# MAGIC --Run this cell once at the begining
+# MAGIC
 # MAGIC --USE CATALOG workspace;
 # MAGIC --CREATE SCHEMA agent;
 
@@ -56,7 +58,6 @@ from mlflow.types.responses import (
 from mlflow.models.resources import DatabricksServingEndpoint, DatabricksFunction
 from pkg_resources import get_distribution
 
-# ---- Configuration you will most likely touch ----
 
 # 1. Foundation model endpoint to use as the LLM.
 #    Change this to any chat-capable Databricks foundation model endpoint
@@ -105,8 +106,7 @@ builtin_tools = UCFunctionToolkit(
 
 # Make the tool schema a bit more forgiving (remove "strict" if present)
 for tool in builtin_tools:
-    if "strict" in tool["function"]:
-        del tool["function"]["strict"]
+    tool["function"].pop("strict", None)
 
 
 # COMMAND ----------
@@ -158,6 +158,22 @@ def call_llm(prompt: str) -> Iterable[dict]:
         # Convert SDK object to plain dict so MLflow helpers can consume it
         yield chunk.to_dict()
 
+def _build_text_events(text: str, item_id: str):
+    """Yield minimal Responses events for a plain text answer."""
+    yield {
+        "type": "response.output_text.delta",
+        "item_id": item_id,
+        "delta": text,
+    }
+    yield {
+        "type": "response.output_item.done",
+        "item": {
+            "id": item_id,
+            "content": [{"text": text, "type": "output_text"}],
+            "role": "assistant",
+            "type": "message",
+        },
+    }
 
 # COMMAND ----------
 
@@ -170,35 +186,72 @@ def call_llm(prompt: str) -> Iterable[dict]:
 
 # COMMAND ----------
 
-def run_agent(prompt: str) -> Iterable[dict]:
+EXPLANATION_SYSTEM_PROMPT = (
+    "You are a tiny analytics assistant. "
+    "Answer in English. "
+    "First sentence: direct answer (for example: "
+    '"The city with the highest total revenue is X"). '
+    "Optionally, add one short sentence explaining what you did. "
+    "Do not print the full table unless the user explicitly asks for it."
+)
+
+def run_agent(user_prompt: str):
     """
-    Execute a single agent turn and yield Responses-compatible events (as dicts).
+    Simple agent:
 
-    This is the core "agent brain" we will later wrap into a ResponsesAgent
-    so it can be logged and served with MLflow.
+    1) Call the LLM with tools enabled.
+    2) If the LLM decides to call system.ai.python_exec, execute it.
+    3) Call the LLM again to turn the tool output into a short answer.
+    4) Yield Responses-style events for the final text.
     """
-    last_chunk = None
 
-    # Stream model output and convert it to Responses events
-    for chunk in output_to_responses_items_stream(call_llm(prompt)):
-        last_chunk = chunk
-        yield chunk.model_dump(exclude_none=True)
+    # Step 1: first LLM call with tools
+    messages = [
+        {"role": "user", "content": user_prompt},
+    ]
+    first = openai_client.chat.completions.create(
+        model=LLM_ENDPOINT_NAME,
+        messages=messages,
+        tools=builtin_tools,
+    )
+    assistant_msg = first.choices[0].message
+    completion_id = first.id
+    tool_calls = getattr(assistant_msg, "tool_calls", None)
 
-    # If the last item was a tool call, execute the tool
-    if last_chunk is not None and last_chunk.item.get("type") == "function_call":
-        tool_name = last_chunk.item["name"]
-        tool_args = json.loads(last_chunk.item["arguments"])
-        tool_result = call_tool(tool_name, tool_args)
+    # Case A: no tool used -> just return the model's answer
+    if not tool_calls:
+        final_text = assistant_msg.content or ""
+        yield from _build_text_events(final_text, completion_id)
+        return
 
-        # Wrap the tool result in a Responses output item
-        yield {
-            "type": "response.output_item.done",
-            "item": create_function_call_output_item(
-                call_id=last_chunk.item["call_id"],
-                output=tool_result,
-            ),
-        }
+    # Case B: the model decided to use system.ai.python_exec
+    call = tool_calls[0]
+    tool_output = call_tool(
+        call.function.name,
+        json.loads(call.function.arguments),
+    )
 
+    # Step 2: second LLM call to explain the tool result
+    followup_messages = [
+        {"role": "system", "content": EXPLANATION_SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+        assistant_msg.to_dict(),  # contains the tool_call metadata
+        {
+            "role": "tool",
+            "name": call.function.name,
+            "tool_call_id": call.id,
+            "content": tool_output,
+        },
+    ]
+    second = openai_client.chat.completions.create(
+        model=LLM_ENDPOINT_NAME,
+        messages=followup_messages,
+    )
+    final_msg = second.choices[0].message
+    final_text = final_msg.content or ""
+    completion2_id  = second.id
+
+    yield from _build_text_events(final_text, completion2_id )
 
 # COMMAND ----------
 
@@ -222,8 +275,8 @@ for event in run_agent(
 # MAGIC
 # MAGIC This wrapper:
 # MAGIC
-# MAGIC * Implements `predict_stream()` → yields `ResponsesAgentStreamEvent`.
-# MAGIC * Implements `predict()` → returns `ResponsesAgentResponse`.
+# MAGIC * Implements `predict_stream()` -> yields `ResponsesAgentStreamEvent`.
+# MAGIC * Implements `predict()` -> returns `ResponsesAgentResponse`.
 # MAGIC * Will be the actual **model object** that we log with MLflow.
 
 # COMMAND ----------
@@ -293,8 +346,7 @@ for e in AGENT.predict_stream(test_request):
 # MAGIC     create_function_call_output_item,
 # MAGIC )
 # MAGIC
-# MAGIC # ---- Configuration ----
-# MAGIC LLM_ENDPOINT_NAME = "databricks-meta-llama-3-3-70b-instruct"
+# MAGIC LLM_ENDPOINT_NAME = "databricks-meta-llama-3-3-70b-instruct"  # LLM endpoint name
 # MAGIC
 # MAGIC SYSTEM_PROMPT = textwrap.dedent(
 # MAGIC     """
@@ -315,25 +367,27 @@ for e in AGENT.predict_stream(test_request):
 # MAGIC     - Invent 5-10 realistic rows and base your answer on that table.
 # MAGIC     - After the tool call, briefly explain in natural language what you did.
 # MAGIC     """
-# MAGIC )
+# MAGIC )  # System prompt to steer the agent
 # MAGIC
-# MAGIC # Enable tracing in the deployed agent as well
-# MAGIC mlflow.openai.autolog()
+# MAGIC mlflow.openai.autolog()  # Enable tracing in the deployed agent
 # MAGIC
-# MAGIC openai_client = WorkspaceClient().serving_endpoints.get_open_ai_client()
-# MAGIC uc_function_client = DatabricksFunctionClient()
+# MAGIC openai_client = WorkspaceClient().serving_endpoints.get_open_ai_client()  # OpenAI-compatible client
+# MAGIC uc_function_client = DatabricksFunctionClient()  # UC function client
 # MAGIC
 # MAGIC builtin_tools = UCFunctionToolkit(
 # MAGIC     function_names=["system.ai.python_exec"],
 # MAGIC     client=uc_function_client,
-# MAGIC ).tools
+# MAGIC ).tools  # Load built-in Python code interpreter tool
 # MAGIC
 # MAGIC for tool in builtin_tools:
-# MAGIC     if "strict" in tool["function"]:
-# MAGIC         del tool["function"]["strict"]
+# MAGIC     tool["function"].pop("strict", None)
 # MAGIC
 # MAGIC
 # MAGIC def call_tool(tool_name: str, parameters: dict) -> str:
+# MAGIC     """
+# MAGIC     Execute a Unity Catalog function tool and return its textual result.
+# MAGIC     Only supports the built-in Python executor.
+# MAGIC     """
 # MAGIC     if tool_name != "system__ai__python_exec":
 # MAGIC         msg = f"Unknown tool: {tool_name}"
 # MAGIC         raise ValueError(msg)
@@ -342,10 +396,14 @@ for e in AGENT.predict_stream(test_request):
 # MAGIC         "system.ai.python_exec",
 # MAGIC         parameters=parameters,
 # MAGIC     )
-# MAGIC     return result.value
+# MAGIC     return result.value  # Return the text printed by the Python code
 # MAGIC
 # MAGIC
 # MAGIC def call_llm(prompt: str) -> Iterable[dict]:
+# MAGIC     """
+# MAGIC     Call the Databricks foundation model with streaming enabled.
+# MAGIC     Yields raw OpenAI-style chunks as dicts.
+# MAGIC     """
 # MAGIC     messages = [
 # MAGIC         {"role": "system", "content": SYSTEM_PROMPT},
 # MAGIC         {"role": "user", "content": prompt},
@@ -356,34 +414,104 @@ for e in AGENT.predict_stream(test_request):
 # MAGIC         tools=builtin_tools,
 # MAGIC         stream=True,
 # MAGIC     ):
-# MAGIC         yield chunk.to_dict()
+# MAGIC         yield chunk.to_dict()  # Convert SDK object to plain dict
+# MAGIC
+# MAGIC def _build_text_events(text: str, item_id: str):
+# MAGIC     """Yield minimal Responses events for a plain text answer."""
+# MAGIC     yield {
+# MAGIC         "type": "response.output_text.delta",
+# MAGIC         "item_id": item_id,
+# MAGIC         "delta": text,
+# MAGIC     }
+# MAGIC     yield {
+# MAGIC         "type": "response.output_item.done",
+# MAGIC         "item": {
+# MAGIC             "id": item_id,
+# MAGIC             "content": [{"text": text, "type": "output_text"}],
+# MAGIC             "role": "assistant",
+# MAGIC             "type": "message",
+# MAGIC         },
+# MAGIC     }
 # MAGIC
 # MAGIC
-# MAGIC def run_agent(prompt: str) -> Iterable[dict]:
-# MAGIC     last_chunk = None
-# MAGIC     for chunk in output_to_responses_items_stream(call_llm(prompt)):
-# MAGIC         last_chunk = chunk
-# MAGIC         yield chunk.model_dump(exclude_none=True)
+# MAGIC EXPLANATION_SYSTEM_PROMPT = (
+# MAGIC     "You are a tiny analytics assistant. "
+# MAGIC     "Answer in English. "
+# MAGIC     "First sentence: direct answer (for example: "
+# MAGIC     '"The city with the highest total revenue is X"). '
+# MAGIC     "Optionally, add one short sentence explaining what you did. "
+# MAGIC     "Do not print the full table unless the user explicitly asks for it."
+# MAGIC )
 # MAGIC
-# MAGIC     if last_chunk is not None and last_chunk.item.get("type") == "function_call":
-# MAGIC         tool_name = last_chunk.item["name"]
-# MAGIC         tool_args = json.loads(last_chunk.item["arguments"])
-# MAGIC         tool_result = call_tool(tool_name, tool_args)
-# MAGIC         yield {
-# MAGIC             "type": "response.output_item.done",
-# MAGIC             "item": create_function_call_output_item(
-# MAGIC                 call_id=last_chunk.item["call_id"],
-# MAGIC                 output=tool_result,
-# MAGIC             ),
-# MAGIC         }
+# MAGIC def run_agent(user_prompt: str):
+# MAGIC     """
+# MAGIC     Simple agent:
+# MAGIC
+# MAGIC     1) Call the LLM with tools enabled.
+# MAGIC     2) If the LLM decides to call system.ai.python_exec, execute it.
+# MAGIC     3) Call the LLM again to turn the tool output into a short answer.
+# MAGIC     4) Yield Responses-style events for the final text.
+# MAGIC     """
+# MAGIC
+# MAGIC     # Step 1: first LLM call with tools
+# MAGIC     messages = [
+# MAGIC         {"role": "user", "content": user_prompt},
+# MAGIC     ]
+# MAGIC     first = openai_client.chat.completions.create(
+# MAGIC         model=LLM_ENDPOINT_NAME,
+# MAGIC         messages=messages,
+# MAGIC         tools=builtin_tools,
+# MAGIC     )
+# MAGIC     assistant_msg = first.choices[0].message
+# MAGIC     completion_id = first.id
+# MAGIC     tool_calls = getattr(assistant_msg, "tool_calls", None)
+# MAGIC
+# MAGIC     # Case A: no tool used -> just return the model's answer
+# MAGIC     if not tool_calls:
+# MAGIC         final_text = assistant_msg.content or ""
+# MAGIC         yield from _build_text_events(final_text, completion_id)
+# MAGIC         return
+# MAGIC
+# MAGIC     # Case B: the model decided to use system.ai.python_exec
+# MAGIC     call = tool_calls[0]
+# MAGIC     tool_output = call_tool(
+# MAGIC         call.function.name,
+# MAGIC         json.loads(call.function.arguments),
+# MAGIC     )
+# MAGIC
+# MAGIC     # Step 2: second LLM call to explain the tool result
+# MAGIC     followup_messages = [
+# MAGIC         {"role": "system", "content": EXPLANATION_SYSTEM_PROMPT},
+# MAGIC         {"role": "user", "content": user_prompt},
+# MAGIC         assistant_msg.to_dict(),  # contains the tool_call metadata
+# MAGIC         {
+# MAGIC             "role": "tool",
+# MAGIC             "name": call.function.name,
+# MAGIC             "tool_call_id": call.id,
+# MAGIC             "content": tool_output,
+# MAGIC         },
+# MAGIC     ]
+# MAGIC     second = openai_client.chat.completions.create(
+# MAGIC         model=LLM_ENDPOINT_NAME,
+# MAGIC         messages=followup_messages,
+# MAGIC     )
+# MAGIC     final_msg = second.choices[0].message
+# MAGIC     final_text = final_msg.content or ""
+# MAGIC     completion2_id  = second.id
+# MAGIC
+# MAGIC     yield from _build_text_events(final_text, completion2_id )
 # MAGIC
 # MAGIC
 # MAGIC class TinyAnalyticsAgent(ResponsesAgent):
+# MAGIC     """
+# MAGIC     Minimal ResponsesAgent wrapper around `run_agent`.
+# MAGIC     Implements predict_stream and predict for MLflow serving.
+# MAGIC     """
 # MAGIC     def predict_stream(
 # MAGIC         self,
 # MAGIC         request: ResponsesAgentRequest,
 # MAGIC     ) -> Iterable[ResponsesAgentStreamEvent]:
-# MAGIC         prompt = request.input[-1].content
+# MAGIC         prompt = request.input[-1].content  # Use last message as user prompt
 # MAGIC         for chunk in run_agent(prompt):
 # MAGIC             yield ResponsesAgentStreamEvent(**chunk)
 # MAGIC
@@ -396,8 +524,8 @@ for e in AGENT.predict_stream(test_request):
 # MAGIC         return ResponsesAgentResponse(output=outputs)
 # MAGIC
 # MAGIC
-# MAGIC AGENT = TinyAnalyticsAgent()
-# MAGIC mlflow.models.set_model(AGENT)
+# MAGIC AGENT = TinyAnalyticsAgent()  # Instantiate the agent
+# MAGIC mlflow.models.set_model(AGENT)  # Register the agent for MLflow logging/serving
 
 # COMMAND ----------
 
@@ -410,26 +538,26 @@ for e in AGENT.predict_stream(test_request):
 
 # COMMAND ----------
 
-mlflow.set_registry_uri("databricks-uc")
+mlflow.set_registry_uri("databricks-uc")  # Set registry to Unity Catalog
 
 resources = [
-    DatabricksServingEndpoint(endpoint_name=LLM_ENDPOINT_NAME),
-    DatabricksFunction(function_name="system.ai.python_exec"),
+    DatabricksServingEndpoint(endpoint_name=LLM_ENDPOINT_NAME),  # Reference LLM endpoint
+    DatabricksFunction(function_name="system.ai.python_exec"),   # Reference Python exec tool
 ]
 
-with mlflow.start_run():
+with mlflow.start_run():  # Start MLflow run for logging
     logged_agent_info = mlflow.pyfunc.log_model(
-        name ="agent",
-        python_model="uc_analytics_agent.py",
+        name="agent",  # Name for the logged model
+        python_model="uc_analytics_agent.py",  # Python file containing agent code
         extra_pip_requirements=[
             f"databricks-connect=="
             f"{get_distribution('databricks-connect').version}"
-        ],
-        resources=resources,
-        registered_model_name=REGISTERED_MODEL_NAME,
+        ],  # Ensure correct databricks-connect version
+        resources=resources,  # Attach serving endpoint and function as resources
+        registered_model_name=REGISTERED_MODEL_NAME,  # Register model in UC
     )
 
-logged_agent_info
+logged_agent_info  # Display logged model info
 
 # COMMAND ----------
 
