@@ -1,5 +1,8 @@
 # Tiny Analytics Agent on Databricks (Free Edition)
 
+![Architecture.png](assets/Architecture.png)
+
+
 A very small **analytics agent** built on Databricks:
 
 - Uses a **foundation model endpoint** (LLM).
