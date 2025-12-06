@@ -72,6 +72,7 @@ The Agent endpoint loads the MLflow model `TinyAnalyticsAgent` and forwards the 
 3. Optional second call: ask the LLM to turn the tool output into a short, user-friendly answer.
 4. Convert the final text into Responses events and return.
 
+![diagram.png](assets/diagram.png)
 ---
 
 ## 3. Components
